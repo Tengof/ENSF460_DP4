@@ -1,8 +1,8 @@
 /*
  * File:   main.c
- * Author: Basema Khan, Michelle Yoon, Vincent Fong
+ * Author: UPDATE THIS WITH YOUR GROUP MEMBER NAMES OR POTENTIALLY LOSE POINTS
  *
- * Created on November 4, 2026
+ * Created on: USE THE INFORMATION FROM THE HEADER MPLAB X IDE GENERATES FOR YOU
  */
 
 // FBS
@@ -53,100 +53,147 @@
 #include <p24F16KA101.h>
 #include "clkChange.h"
 #include "UART2.h"
+
+
+#include <xc.h>
+#include <stdio.h>
+#include <stdint.h>
 #include "ADC.h"
-#include "Timer.h"
-#include "IOs.h"
-
-void displayBarGraph(uint16_t ADCValue);
-
-int main(void) {
-    uint16_t ADCValue;              // Stores the converted ADC reading
-    uint16_t count = 0;             // Counts the number of 100ms timer intervals
-    uint16_t mode = 0;              // Current operating mode: 0 or 1
-    uint16_t previousPB1 = 1;       // Previous PB1 state (1 = unpressed)
-    
-    newClk(500);        // Sets clock to 500 kHz
-    InitUART2();        // Initialize UART2
-    TimerInit();        // Initialize Timer 2 and 3
-    IOinit();           // Initialize PB1
-    ADCinit();          // Initialized ADC module
-
-    T2CONbits.TON = 1;      // Start Timer 2
-    
-    while(1){
-        uint16_t currentPB1 = PORTBbits.RB7;
-        
-        // Detect a new press (transition from 1 to 0)
-        if(previousPB1 == 1 && currentPB1 == 0){
-            mode = 1 - mode;    // mode will be 1 if pressed and 0 if not pressed
-            
-            if(mode == 0){
-                Disp2String("\r\nSwitched to Mode 0\r\n");
-            } else {
-                Disp2String("\r\nSwitched to Mode 1\r\n");
-            }
-        }
-        
-        previousPB1 = currentPB1;       // Update previous button state every iteration
-        
-        // Check if Timer 2 has completed a 100ms interval
-        if(TMR2flag == 1){
-            TMR2flag = 0;       // Clear Timer 2 flag
-            count++;        // Increment the 100ms counter
-            
-            // After 10 intervals, about 1 second has passed
-            if(count == 10){
-                count = 0;      // Reset counter
-                
-                ADCValue = do_ADC();        // Read potentiometer voltage
-                
-                // Mode 0: Display terminal bar graph
-                if(mode == 0){
-                    displayBarGraph(ADCValue);
-                } else {
-                    // Mode 1: Send numerical ADC value to Python file
-                    Disp2Dec(ADCValue);
-                    Disp2String("\r\n");
-                }    
-            }
-            
-            TMR2 = 0;       // Reset Timer 2 counter
-            T2CONbits.TON = 1;      // Restart Timer 2
-        }
-    }
-    
-    return 0;
-}
-
-// Timer 2 ISR
-void __attribute__((interrupt, no_auto_psv)) _T2Interrupt(void){
-    IFS0bits.T2IF = 0;      // Clear Timer 2 interrupt flag
-    T2CONbits.TON = 0;      // Stope Timer 2
-    TMR2flag = 1;       // Signal to the loop in main that 100ms has passed
-}
+#include "UART2.h"      
  
 
-// Displays a bar graph corresponding to the ADC reading
-void displayBarGraph(uint16_t ADCValue){
-    uint16_t i;
-    
-    uint16_t barLength = ((uint32_t)ADCValue * 40) / 1023;      // Scale 10-bit ADC reading to 40 characters
-    Disp2String("Mode 0: [");
-    
-    // Print one * for each unit of bar length
-    for(i = 0; i < barLength; i++){
-        XmitUART2('*', 1);
+#define FCY              4000000UL   //  (Fosc / 2)
+#define TICK_MS          100UL       // one tick every 100 ms
+#define STREAM_SECONDS   10UL
+#define SAMPLES_PER_RUN  ((STREAM_SECONDS * 1000UL) / TICK_MS)   // 100 samples
+#define BAR_MAX          32          // longest bar (plus 1 star minimum)
+ 
+//Push buttons from your kit (active low, pressed = 0) 
+#define PB1_PRESSED()  (PORTBbits.RB7 == 0)
+#define PB2_PRESSED()  (PORTAbits.RA4 == 0)
+ 
+typedef enum { MODE0, MODE1_WAIT, MODE1_STREAM } state_t;
+ 
+volatile uint8_t tick = 0;   // set by Timer2 ISR
+ 
+//Timer2: periodic wake-up tick
+void __attribute__((interrupt, no_auto_psv)) _T2Interrupt(void)
+{
+    IFS0bits.T2IF = 0;       // clear flag or the ISR repeats forever
+    tick = 1;
+}
+ 
+void initTimer2(void)
+{
+    T2CON = 0;
+    T2CONbits.TCKPS = 0b11;                        // prescaler 1:256
+    TMR2 = 0;
+    PR2 = (uint16_t)((FCY / 256UL) * TICK_MS / 1000UL);  // period = TICK_MS
+    IPC1bits.T2IP = 3;                             // interrupt priority
+    IFS0bits.T2IF = 0;                             // clear flag before enabling
+    IEC0bits.T2IE = 1;                             // enable Timer2 interrupt
+    T2CONbits.TON = 1;                             // start timer
+}
+ 
+/* ---------- Buttons ---------- */
+void initIO(void)
+{
+    AD1PCFG = 0xFFFF;          // all pins digital; do_ADC() makes its own pin analog
+ 
+    TRISBbits.TRISB7 = 1;      // PB1 input
+    TRISAbits.TRISA4 = 1;      // PB2 input
+    CNPU2bits.CN23PUE = 1;     // pull-up on RB7 (PB1)  
+    CNPU1bits.CN0PUE  = 1;     // pull-up on RA4 (PB2)
+}
+ 
+//Mode 0: bar graph + hex on one line
+void showBarGraph(uint16_t value)
+{
+    char line[64];
+    uint8_t stars = (uint8_t)(((uint32_t)value * BAR_MAX) / 1023UL) + 1;  // 1 to 33
+    uint8_t i, n = 0;
+ 
+    n += sprintf(&line[n], "\rMode 0: ");          // \r = go back to start of line
+    for (i = 0; i < stars; i++) line[n++] = '*';
+    n += sprintf(&line[n], " 0x%03X", value);
+    for (i = stars; i < BAR_MAX + 1; i++) line[n++] = ' ';   // erase leftovers
+    line[n] = '\0';
+ 
+    Disp2String(line);         
+}
+ 
+//Mode 1: one value per line for Python
+void sendValue(uint16_t value)
+{
+    char line[12];
+    sprintf(line, "%u\r\n", value);
+    Disp2String(line);
+}
+ 
+int main(void)
+{
+    state_t state = MODE0;
+    uint8_t pb1Prev = 0, pb2Prev = 0;
+    uint16_t sampleCount = 0;
+ 
+    initIO();
+    InitUART2();               
+    initTimer2();
+ 
+    while (1)
+    {
+        if (tick)
+        {
+            tick = 0;
+ 
+            // Edge detection: act once per press, not while held 
+            uint8_t pb1 = PB1_PRESSED();
+            uint8_t pb2 = PB2_PRESSED();
+            uint8_t pb1Edge = pb1 && !pb1Prev;
+            uint8_t pb2Edge = pb2 && !pb2Prev;
+            pb1Prev = pb1;
+            pb2Prev = pb2;
+ 
+            switch (state)
+            {
+                case MODE0:
+                    if (pb1Edge) {
+                        state = MODE1_WAIT;
+                        Disp2String("\r\nMode 1: close terminal, run Python, press PB2 to stream\r\n");
+                        break;
+                    }
+                    showBarGraph(do_ADC());
+                    break;
+ 
+                case MODE1_WAIT:
+                    if (pb1Edge) {
+                        state = MODE0;
+                        Disp2String("\r\n");
+                        break;
+                    }
+                    if (pb2Edge) {
+                        sampleCount = 0;
+                        state = MODE1_STREAM;
+                    }
+                    break;
+ 
+                case MODE1_STREAM:
+                    if (pb1Edge) {
+                        state = MODE0;
+                        Disp2String("\r\n");
+                        break;
+                    }
+                    sendValue(do_ADC());
+                    if (++sampleCount >= SAMPLES_PER_RUN) {
+                        Disp2String("END\r\n");     // tells Python the run is over
+                        state = MODE1_WAIT;
+                    }
+                    break;
+            }
+        }
+ 
+        Idle();   // CPU sleeps until the next interrupt (Timer2 tick)
     }
-    
-    // Print spaces to keep the bar graph a fixed length
-    for(i = barLength; i < 40; i++){
-        XmitUART2(' ', 1);
-    }
-    
-    Disp2String("] ADC:");
-    
-    // Display ADC value in hexadecimal
-    Disp2Hex(ADCValue);
-    
-    Disp2String("\r\n");
+ 
+    return 0;
 }
