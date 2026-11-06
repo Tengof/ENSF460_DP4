@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt  # plotting
 
 # Settings
 
-PORT = "COM7"           # COM port of the board (check Device Manager)
+PORT = "COM7"           
 BAUD = 9600             
 VDD = 3.0               # ADC reference voltage (Vmax) in volts
 ADC_MAX = 1023          # largest 10-bit ADC value
